@@ -87,6 +87,32 @@ struct dbg_reg_def_t {
 	int offset;
 };
 
+struct kgdb_pci_xref {
+	struct list_head list;
+	resource_size_t phys_addr;
+	resource_size_t virt_addr;
+	unsigned long bar_size;
+	int bar;
+	struct pci_dev * dev;
+};
+
+struct kgdb_pci_map_rules {
+	unsigned short vendor;
+	unsigned short bar_mask;
+	unsigned short bus_number;
+};
+
+extern struct kgdb_pci_xref kgdb_pci_xref_instance;
+extern struct kgdb_pci_map_rules kgdb_pci_map_rules_instance;
+extern int kgdb_pci_map_rules_override;
+
+#define KGDB_PCI_MAP_RULES_OVERRIDE_ALL  10
+#define KGDB_PCI_MAP_RULES_OVERRIDE_NONE 11
+#define KGDB_PCI_MAP_RULES_NO_OVERRIDE   12
+
+void kgdb_pci_cmd(void);
+void kgdb_pci_init(void);
+
 #ifndef DBG_MAX_REG_NUM
 #define DBG_MAX_REG_NUM 0
 #else

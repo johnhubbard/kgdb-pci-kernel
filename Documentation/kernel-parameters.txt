@@ -1244,6 +1244,27 @@ bytes respectively. Such letter suffixes can also be entirely omitted.
 			 kms, kbd format: kms,kbd
 			 kms, kbd and serial format: kms,kbd,<ser_dev>[,baud]
 
+	kgdbpci=	[KGDB,HW] Tell the kernel debugger whether or not to map
+			PCI physical BARs to virtual memory.
+
+			Format: kgdbpci=["all"] | ["none"] |
+					[<PCI_bus>,<vendor>,<bar_mask>]
+			Wildcards:
+				--Use "all" or "none" to map all, or none of the
+				devices
+				--Use 0xffff to match any vendor
+				--Use 0xff to match any PCI bus
+				--Use 0x1f to map all BARs
+			Example 1: kgdbpci=all
+			Example 2: kgdbpci=none
+			Example 3: kgdbpci=0,0x1234,5
+				(maps only vendor 0x1234's devices
+				that are on PCI bus 0, and only BARS
+				0 and 2 of each)
+			Example 4: kgdbpci=0xff,0x1234,0x1f
+				(maps only vendor 0x1234's devices, on
+				any PCI bus, all BARs)
+
 	kgdbwait	[KGDB] Stop kernel execution and enter the
 			kernel debugger at the earliest opportunity.
 

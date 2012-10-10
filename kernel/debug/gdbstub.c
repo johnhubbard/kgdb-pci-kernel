@@ -35,9 +35,17 @@
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
 #include <asm/unaligned.h>
+#include <linux/pci.h>
 #include "debug_core.h"
 
 #define KGDB_MAX_THREAD_QUERY 17
+
+struct kgdb_pci_xref kgdb_pci_xref_instance;
+struct kgdb_pci_map_rules kgdb_pci_map_rules_instance;
+static const unsigned char KGDB_PCI_ANY_BUS = 0xff;
+static const unsigned short KGDB_PCI_ANY_VENDOR = 0xffff;
+
+int kgdb_pci_map_rules_override = 11;
 
 /* Our I/O buffers. */
 static char			remcom_in_buffer[BUFMAX];
@@ -738,6 +746,10 @@ static void gdb_cmd_query(struct kgdb_state *ks)
 		*(--ptr) = '\0';
 		break;
 
+	case 'P':
+		/* KGDB-PCI command*/
+		kgdb_pci_cmd();
+		break;
 	case 'C':
 		/* Current thread id */
 		strcpy(remcom_out_buffer, "QC");
@@ -1139,3 +1151,308 @@ void gdbstub_exit(int status)
 	if (dbg_io_ops->flush)
 		dbg_io_ops->flush();
 }
+
+static int kgdb_pci_user_wants_to_map(struct pci_dev *dev, int bar)
+{
+	struct kgdb_pci_map_rules *rule = &kgdb_pci_map_rules_instance;
+
+	if (kgdb_pci_map_rules_override == KGDB_PCI_MAP_RULES_OVERRIDE_ALL)
+		return 1;
+
+	if (kgdb_pci_map_rules_override == KGDB_PCI_MAP_RULES_OVERRIDE_NONE)
+		return 0;
+
+	if ((rule->bus_number == dev->bus->number
+	     || rule->bus_number == KGDB_PCI_ANY_BUS) &&
+	    (rule->vendor == dev->vendor
+	     || rule->vendor == KGDB_PCI_ANY_VENDOR) &&
+	    ((1 << bar) & rule->bar_mask))
+		return 1;
+	return 0;
+}
+
+static void kgdb_pci_map_device(struct pci_dev *dev)
+{
+	resource_size_t bar_vaddr = 0;
+	int bar;
+
+	for (bar = 0; bar < PCI_ROM_RESOURCE; ++bar) {
+
+		struct kgdb_pci_xref *new;
+		unsigned long bar_size = pci_resource_len(dev, bar);
+		resource_size_t bar_start = pci_resource_start(dev, bar);
+
+		if ((0 == bar_size) || !kgdb_pci_user_wants_to_map(dev, bar))
+			continue;
+
+		bar_vaddr = (resource_size_t) ioremap_nocache(bar_start,
+							      bar_size);
+		if (!bar_vaddr)
+			return;
+
+		new = kmalloc(sizeof(*new), GFP_KERNEL);
+
+		if (!new) {
+			iounmap((void __iomem *)bar_vaddr);
+			printk(KERN_NOTICE "%s: kmalloc(struct kgdb_mem_xref) "
+					   "failed for bus: %02x, "
+					   "vendor:%02x, dev:%02x\n",
+			       __func__, dev->bus->number, dev->vendor,
+			       dev->device);
+			return;
+
+		}
+		new->bar        = bar;
+		new->phys_addr  = bar_start;
+		new->virt_addr  = bar_vaddr;
+		new->bar_size   = bar_size;
+		new->dev        = dev;
+		list_add_tail(&new->list, &kgdb_pci_xref_instance.list);
+	}
+}
+
+static void kgdb_pci_print_maps(void)
+{
+	struct kgdb_pci_xref *xref;
+
+	if (list_empty(&kgdb_pci_xref_instance.list)) {
+		printk(KERN_INFO "%s: No PCI devices mapped.\n", __func__);
+		return;
+	}
+
+	list_for_each_entry(xref, &kgdb_pci_xref_instance.list, list) {
+		printk(KERN_INFO "kgdb PCI: bus: 0x%x, vendor:0x%02x, "
+				 "dev:0x%02x, bar[%d]: phys: 0x%lx, "
+				 "addr: 0x%lx, length: 0x%lx\n",
+		       xref->dev->bus->number, xref->dev->vendor,
+		       xref->dev->device, xref->bar,
+		       (unsigned long)xref->phys_addr,
+		       (unsigned long)xref->virt_addr, xref->bar_size);
+	}
+}
+
+static void kgdb_pci_ls(void)
+{
+	struct kgdb_pci_xref *xref;
+	int pos = 0;
+	int count = 0;
+
+	printk(KERN_INFO "%s: Entering\n", __func__);
+
+	list_for_each_entry(xref, &kgdb_pci_xref_instance.list, list) {
+		if (count > 0) {
+			pos += sprintf(remcom_out_buffer + pos, "\n");
+		}
+		pos += sprintf(remcom_out_buffer + pos,
+			       "bus: 0x%x, vendor:0x%02x, "
+				"dev:0x%02x, bar[%d]: phys: 0x%lx, "
+				"addr: 0x%lx, length: 0x%lx",
+		       xref->dev->bus->number, xref->dev->vendor,
+			       xref->dev->device, xref->bar,
+		       (unsigned long)xref->phys_addr,
+		       (unsigned long)xref->virt_addr, xref->bar_size);
+
+		printk(KERN_INFO "%s: Returning string: %s\n",
+		       __func__, remcom_out_buffer);
+		++count;
+	}
+}
+
+static void kgdb_pci_get_device(short bus_num)
+{
+	struct kgdb_pci_xref *xref;
+	int pos = 0;
+	int count = 0;
+
+	printk(KERN_INFO "%s: bus_num: 0x%x\n", __func__, bus_num);
+
+	list_for_each_entry(xref, &kgdb_pci_xref_instance.list, list) {
+		if (bus_num == xref->dev->bus->number) {
+			if (count > 0) {
+				pos += sprintf(remcom_out_buffer + pos, " ");
+			}
+			pos += sprintf(remcom_out_buffer + pos,
+				       "bar[%d]:0x%lx",
+			       xref->bar, (unsigned long)xref->virt_addr);
+
+			printk(KERN_INFO "%s: Returning string: %s\n",
+			       __func__, remcom_out_buffer);
+			++count;
+		}
+	}
+}
+
+static int kgdb_pci_format_output(struct pci_dev *dev,
+				  u32 offset_addr, u32 num_dwords)
+{
+	int result;
+	int pos = 0;
+	u32 value = 0;
+	int i;
+	const static int NUM_ENTRIES_PER_LINE = 4;
+
+	for (i = 0; i < num_dwords; ++i) {
+		result = pci_read_config_dword(dev,
+					       offset_addr + i * 4,
+					       &value);
+		if (0 == result) {
+			if ((i % NUM_ENTRIES_PER_LINE) == 0) {
+				pos += sprintf(remcom_out_buffer + pos,
+					       "\n0x%03x:\t",
+					       offset_addr + i * 4);
+			}
+
+			pos += sprintf(remcom_out_buffer + pos, "\t0x%08x",
+				       value);
+
+		}
+		else {
+			sprintf(remcom_out_buffer + pos,
+				"Read failure at offset 0x%x, dword %d: %d",
+				offset_addr, i, result);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static void kgdb_pci_read_config(unsigned bus_num, u32 offset_addr,
+				 u32 num_dwords)
+{
+	struct kgdb_pci_xref *xref;
+
+	list_for_each_entry(xref, &kgdb_pci_xref_instance.list, list) {
+		if (bus_num == xref->dev->bus->number) {
+			kgdb_pci_format_output(xref->dev, offset_addr,
+					       num_dwords);
+			return;
+		}
+	}
+	sprintf(remcom_out_buffer,
+		"PCI config value[offset:0x%x]: NOT FOUND",
+		offset_addr);
+}
+
+static void kgdb_pci_write_config(unsigned bus_num,
+				  u32 offset_addr,
+				  unsigned int value)
+{
+	struct kgdb_pci_xref *xref;
+	int result;
+
+	printk(KERN_INFO "%s: Entering: bus_num: 0x%x, "
+			 "offset: 0x%x,	value: 0x%x\n",
+	       __func__, bus_num, offset_addr, value);
+
+	list_for_each_entry(xref, &kgdb_pci_xref_instance.list, list) {
+		if (bus_num == xref->dev->bus->number) {
+			result = pci_write_config_dword(xref->dev,
+							offset_addr, value);
+			if (0 == result)
+				sprintf(remcom_out_buffer, "Success");
+			else
+				sprintf(remcom_out_buffer,
+					"Write failure: %d", result);
+
+			return;
+		}
+	}
+	printk(KERN_INFO "%s: NOT FOUND: bus_num: 0x%x, "
+			 "offset: 0x%x,	value: 0x%x\n",
+	       __func__, bus_num, offset_addr, value);
+}
+
+void kgdb_pci_cmd(void)
+{
+	unsigned long bus_num;
+	char *ptr;
+	long value = 0;
+	long addr_offset = 0;
+	long num_dwords = 0;
+	const static char ls_cmd[] = "qPCI-ls";
+	const static char get_cmd[] = "qPCI-get";
+	const static char read_config_cmd[] = "qPCI-read-config";
+	const static char write_config_cmd[] = "qPCI-write-config";
+
+	static int ls_cmd_len = sizeof(ls_cmd) - 1;
+	static int get_cmd_len = sizeof(get_cmd) - 1;
+	static int read_config_cmd_len = sizeof(read_config_cmd) - 1;
+	static int write_config_cmd_len = sizeof(write_config_cmd) - 1;
+
+	printk(KERN_INFO "%s: Entering\n", __func__);
+
+	if (0 == strncmp(remcom_in_buffer, ls_cmd, ls_cmd_len)) {
+		kgdb_pci_ls();
+
+	} else if (0 == strncmp(remcom_in_buffer, get_cmd, get_cmd_len)) {
+		ptr = &remcom_in_buffer[get_cmd_len];
+
+		if (kgdb_hex2long(&ptr, &bus_num) > 0)
+			kgdb_pci_get_device(bus_num);
+		else
+			error_packet(remcom_out_buffer, -EINVAL);
+
+	} else if (0 == strncmp(remcom_in_buffer, read_config_cmd,
+			       read_config_cmd_len)) {
+		ptr = &remcom_in_buffer[read_config_cmd_len];
+
+		/* Format in buffer: qPCI-read-configXX,YY,ZZ
+		   where XX is the bus number, YY is the offset (address),
+		   and ZZ is the number of (32-bit) dwords to read.*/
+		if (kgdb_hex2long(&ptr, &bus_num) > 0 && *ptr++ == ',' &&
+                    kgdb_hex2long(&ptr, &addr_offset) > 0 && *ptr++ == ',' &&
+                    kgdb_hex2long(&ptr, &num_dwords) > 0){
+			kgdb_pci_read_config(bus_num, addr_offset, num_dwords);
+		} else
+			error_packet(remcom_out_buffer, -EINVAL);
+
+	} else if (0 == strncmp(remcom_in_buffer, write_config_cmd,
+			       write_config_cmd_len)) {
+		ptr = &remcom_in_buffer[write_config_cmd_len];
+
+		/* Format in buffer: qPCI-write-configXX,YY,ZZ
+		   where XX is the bus number, YY is the offset (address),
+		   and ZZ is the new value. */
+		if (kgdb_hex2long(&ptr, &bus_num) > 0 && *ptr++ == ',' &&
+		    kgdb_hex2long(&ptr, &addr_offset) > 0 && *ptr++ == ',' &&
+		    kgdb_hex2long(&ptr, &value) > 0){
+			kgdb_pci_write_config(bus_num, addr_offset, value);
+		} else
+			error_packet(remcom_out_buffer, -EINVAL);
+	}
+}
+
+static void kgdb_pci_map_bus(struct pci_bus *bus)
+{
+	struct pci_bus *childbus;
+	struct pci_dev *dev;
+
+	if (!bus)
+		return;
+
+	/* Map each device on this bus */
+	list_for_each_entry(dev, &bus->devices, bus_list) {
+		kgdb_pci_map_device(dev);
+	}
+
+	/* Map each child bus on this bus */
+	list_for_each_entry(childbus, &bus->children, node) {
+		kgdb_pci_map_bus(childbus);
+	}
+}
+
+void kgdb_pci_init(void)
+{
+	struct pci_bus *bus;
+
+	INIT_LIST_HEAD(&kgdb_pci_xref_instance.list);
+
+	list_for_each_entry(bus, &pci_root_buses, node) {
+		kgdb_pci_map_bus(bus);
+	}
+
+	kgdb_pci_print_maps();
+}
+EXPORT_SYMBOL_GPL(kgdb_pci_init);
+

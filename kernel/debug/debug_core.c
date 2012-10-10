@@ -1008,4 +1008,37 @@ static int __init opt_kgdb_wait(char *str)
 	return 0;
 }
 
+static int __init kgdb_pci_setup(char *str)
+{
+	int ints[4];
+	struct kgdb_pci_map_rules *rule = &kgdb_pci_map_rules_instance;
+
+	memset(rule, 0, sizeof(*rule));
+	INIT_LIST_HEAD(&kgdb_pci_xref_instance.list);
+
+	if (!str || !strlen(str) || (0 == strcmp(str, "all"))) {
+		kgdb_pci_map_rules_override = KGDB_PCI_MAP_RULES_OVERRIDE_ALL;
+		return 0;
+	} else if (0 == strcmp(str, "none")) {
+		kgdb_pci_map_rules_override = KGDB_PCI_MAP_RULES_OVERRIDE_NONE;
+		return 0;
+	}
+
+	get_options(str, ARRAY_SIZE(ints), ints);
+
+	if (ints[0] > 0) {
+		kgdb_pci_map_rules_override = KGDB_PCI_MAP_RULES_NO_OVERRIDE;
+
+		printk(KERN_NOTICE "%s: FILTER=bus:0x%x,vendor:"
+				   "0x%x,bar_mask:0x%x\n",
+		       __func__, ints[1], ints[2], ints[3]);
+
+		rule->bus_number = ints[1];
+		rule->vendor     = ints[2];
+		rule->bar_mask   = ints[3];
+	}
+	return 0;
+}
+
+__setup("kgdbpci=", kgdb_pci_setup);
 early_param("kgdbwait", opt_kgdb_wait);

@@ -225,6 +225,8 @@ static int __init init_kgdboc(void)
 	if (configured == 1)
 		return 0;
 
+	kgdb_pci_init();
+
 	return configure_kgdboc();
 }
 
